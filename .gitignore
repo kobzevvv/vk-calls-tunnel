@@ -1,22 +1,32 @@
-# Binaries
+# Compiled binaries
+client
+server
 vk-tunnel-client
 vk-tunnel-server
+vk-tunnel-*-linux
 *.exe
+*.exe~
+*.dll
+*.so
+*.dylib
 
 # Go
 vendor/
+*.test
 
-# Python (legacy)
-.venv/
-__pycache__/
-*.pyc
-.pytest_cache/
+# Secrets / env
+.env
+*.pem
+*.key
+wg*.conf
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+*~
 
 # OS
 .DS_Store
+Thumbs.db

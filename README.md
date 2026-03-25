@@ -74,8 +74,55 @@ PersistentKeepalive = 25
 ## Build
 
 ```bash
-go build -o vk-tunnel-client ./cmd/client/
-go build -o vk-tunnel-server ./cmd/server/
+make build          # build for current platform
+make build-linux    # cross-compile for Linux amd64 (for VPS)
+```
+
+## Deploy to Google Cloud (or any VPS)
+
+### One-time setup
+
+```bash
+# 1. Create GCE instance (e2-micro is enough)
+gcloud compute instances create vk-tunnel \
+    --machine-type=e2-micro \
+    --image-family=debian-12 \
+    --image-project=debian-cloud \
+    --zone=europe-west1-b
+
+# 2. Open tunnel port
+gcloud compute firewall-rules create vk-tunnel-allow \
+    --allow=tcp:56000,udp:56000 \
+    --target-tags=vk-tunnel
+
+# 3. SSH in and set up WireGuard
+gcloud compute ssh vk-tunnel -- 'bash -s' < scripts/setup-wireguard.sh
+# Save the client config it prints!
+
+# 4. Deploy tunnel server
+./scripts/deploy-server.sh <VPS_IP>
+```
+
+### Quick redeploy (after code changes)
+
+```bash
+./scripts/deploy-server.sh <VPS_IP>
+# Rebuilds, uploads, restarts systemd service
+```
+
+### Client side (Russia)
+
+```bash
+# 1. Create VK call link: vk.com → Calls → Create link
+# 2. Run tunnel client
+make build
+./vk-tunnel-client -peer <VPS_IP>:56000 -vk-link "https://vk.com/call/join/..." -n 4
+
+# 3. Start WireGuard with the config from setup step
+sudo wg-quick up ./wg0.conf
+
+# 4. Test
+curl https://ifconfig.me   # should show VPS IP
 ```
 
 ## Client flags
