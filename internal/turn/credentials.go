@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -16,6 +18,8 @@ const (
 	vkClientSecret = "QbYic1K3lEV5kTGiqlq2"
 	// OK.ru SDK application key
 	okAppKey = "CGMMEJLGDIHBABABA"
+	// Browser User-Agent (required by VK)
+	userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0"
 )
 
 // Credentials holds TURN server authentication data.
@@ -25,31 +29,23 @@ type Credentials struct {
 	TURNServers []string // IP:port list
 }
 
-var callIDRegexp = regexp.MustCompile(`/call/join/([A-Za-z0-9_-]+)`)
-
 // FetchFromLink extracts TURN credentials from a VK call link.
-// This is a 6-step anonymous OAuth chain:
-// 1. Get anonymous token from login.vk.ru
-// 2. Get anonymous access token payload from VK API
-// 3. Get messages-scoped anonymous token
-// 4. Get call anonymous token from VK API
-// 5. Anonymous login to OK.ru calls backend
-// 6. Join call via OK.ru to get TURN server config
+// 6-step anonymous OAuth chain through VK API and OK.ru.
 func FetchFromLink(vkLink string) (*Credentials, error) {
 	// Step 1: Get anonymous token
-	anonToken, err := getAnonToken("")
+	anonToken, err := getAnonToken("", "")
 	if err != nil {
 		return nil, fmt.Errorf("step 1 (anon token): %w", err)
 	}
 
 	// Step 2: Get anonymous access token payload
-	payload, err := getAnonAccessTokenPayload(anonToken, vkLink)
+	payload, err := getAnonAccessTokenPayload(anonToken)
 	if err != nil {
 		return nil, fmt.Errorf("step 2 (access token payload): %w", err)
 	}
 
 	// Step 3: Get messages-scoped anonymous token
-	msgToken, err := getAnonTokenMessages(payload)
+	msgToken, err := getAnonToken("messages", payload)
 	if err != nil {
 		return nil, fmt.Errorf("step 3 (messages token): %w", err)
 	}
@@ -61,13 +57,13 @@ func FetchFromLink(vkLink string) (*Credentials, error) {
 	}
 
 	// Step 5: OK.ru anonymous login
-	okSession, err := okAnonymousLogin(callToken)
+	sessionKey, err := okAnonymousLogin()
 	if err != nil {
 		return nil, fmt.Errorf("step 5 (ok.ru login): %w", err)
 	}
 
 	// Step 6: Join call via OK.ru — get TURN credentials
-	creds, err := joinCallOK(okSession, callToken, vkLink)
+	creds, err := joinCallOK(sessionKey, callToken, vkLink)
 	if err != nil {
 		return nil, fmt.Errorf("step 6 (join call): %w", err)
 	}
@@ -84,43 +80,63 @@ func FetchFromManual(turnAddr string, username, password string) *Credentials {
 	}
 }
 
-// Step 1: Get anonymous token from login.vk.ru
-func getAnonToken(tokenType string) (string, error) {
+// postForm sends a POST with User-Agent header.
+func postForm(reqURL string, data url.Values) (*http.Response, error) {
+	req, err := http.NewRequest("POST", reqURL, strings.NewReader(data.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", userAgent)
+	return http.DefaultClient.Do(req)
+}
+
+// Step 1 & 3: Get anonymous token from login.vk.ru
+func getAnonToken(tokenType, payload string) (string, error) {
 	params := url.Values{
 		"client_id":     {vkClientID},
 		"client_secret": {vkClientSecret},
+		"app_id":        {vkClientID},
+		"version":       {"1"},
 	}
 	if tokenType != "" {
 		params.Set("token_type", tokenType)
 	}
+	if payload != "" {
+		params.Set("payload", payload)
+	}
 
-	resp, err := http.PostForm("https://login.vk.ru/?act=get_anonym_token", params)
+	resp, err := postForm("https://login.vk.ru/?act=get_anonym_token", params)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 
 	var result struct {
-		Token string `json:"token"`
+		Type string `json:"type"`
+		Data struct {
+			AccessToken string `json:"access_token"`
+		} `json:"data"`
 	}
 	if err := decodeJSON(resp.Body, &result); err != nil {
 		return "", err
 	}
-	if result.Token == "" {
-		return "", fmt.Errorf("empty anonymous token")
+	if result.Data.AccessToken == "" {
+		return "", fmt.Errorf("empty token (type: %s)", result.Type)
 	}
-	return result.Token, nil
+	return result.Data.AccessToken, nil
 }
 
 // Step 2: Get anonymous access token payload
-func getAnonAccessTokenPayload(anonToken, vkLink string) (string, error) {
+func getAnonAccessTokenPayload(anonToken string) (string, error) {
 	params := url.Values{
 		"access_token": {anonToken},
-		"join_link":    {vkLink},
-		"v":            {"5.199"},
 	}
 
-	resp, err := http.PostForm("https://api.vk.com/method/calls.getAnonymousAccessTokenPayload", params)
+	resp, err := postForm(
+		"https://api.vk.ru/method/calls.getAnonymousAccessTokenPayload?v=5.264&client_id="+vkClientID,
+		params,
+	)
 	if err != nil {
 		return "", err
 	}
@@ -136,47 +152,23 @@ func getAnonAccessTokenPayload(anonToken, vkLink string) (string, error) {
 		return "", err
 	}
 	if result.Error != nil {
-		return "", fmt.Errorf("VK API: %s", result.Error.Message)
+		return "", fmt.Errorf("VK API: [%d] %s", result.Error.Code, result.Error.Message)
+	}
+	if result.Response.Payload == "" {
+		return "", fmt.Errorf("empty payload")
 	}
 	return result.Response.Payload, nil
-}
-
-// Step 3: Get messages-scoped anonymous token
-func getAnonTokenMessages(payload string) (string, error) {
-	params := url.Values{
-		"client_id":     {vkClientID},
-		"client_secret": {vkClientSecret},
-		"token_type":    {"messages"},
-		"payload":       {payload},
-	}
-
-	resp, err := http.PostForm("https://login.vk.ru/?act=get_anonym_token", params)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	var result struct {
-		Token string `json:"token"`
-	}
-	if err := decodeJSON(resp.Body, &result); err != nil {
-		return "", err
-	}
-	if result.Token == "" {
-		return "", fmt.Errorf("empty messages token")
-	}
-	return result.Token, nil
 }
 
 // Step 4: Get call anonymous token
 func getCallAnonToken(msgToken, vkLink string) (string, error) {
 	params := url.Values{
 		"access_token": {msgToken},
-		"join_link":    {vkLink},
-		"v":            {"5.199"},
+		"vk_join_link": {vkLink},
+		"name":         {"123"},
 	}
 
-	resp, err := http.PostForm("https://api.vk.com/method/calls.getAnonymousToken", params)
+	resp, err := postForm("https://api.vk.ru/method/calls.getAnonymousToken?v=5.264", params)
 	if err != nil {
 		return "", err
 	}
@@ -192,20 +184,30 @@ func getCallAnonToken(msgToken, vkLink string) (string, error) {
 		return "", err
 	}
 	if result.Error != nil {
-		return "", fmt.Errorf("VK API: %s", result.Error.Message)
+		return "", fmt.Errorf("VK API: [%d] %s", result.Error.Code, result.Error.Message)
+	}
+	if result.Response.Token == "" {
+		return "", fmt.Errorf("empty call token")
 	}
 	return result.Response.Token, nil
 }
 
-// Step 5: OK.ru anonymous login
-func okAnonymousLogin(callToken string) (string, error) {
+// Step 5: OK.ru anonymous login (no VK token needed, creates a fresh session)
+func okAnonymousLogin() (string, error) {
+	deviceID := uuid.New().String()
+	sessionData := fmt.Sprintf(
+		`{"version":2,"device_id":"%s","client_version":1.1,"client_type":"SDK_JS"}`,
+		deviceID,
+	)
+
 	params := url.Values{
 		"method":          {"auth.anonymLogin"},
+		"format":          {"JSON"},
 		"application_key": {okAppKey},
-		"token":           {callToken},
+		"session_data":    {sessionData},
 	}
 
-	resp, err := http.PostForm("https://calls.okcdn.ru/fb.do", params)
+	resp, err := postForm("https://calls.okcdn.ru/fb.do", params)
 	if err != nil {
 		return "", err
 	}
@@ -213,33 +215,43 @@ func okAnonymousLogin(callToken string) (string, error) {
 
 	var result struct {
 		SessionKey string `json:"session_key"`
+		ErrorMsg   string `json:"error_msg"`
 	}
 	if err := decodeJSON(resp.Body, &result); err != nil {
 		return "", err
 	}
+	if result.ErrorMsg != "" {
+		return "", fmt.Errorf("OK.ru: %s", result.ErrorMsg)
+	}
 	if result.SessionKey == "" {
-		return "", fmt.Errorf("empty OK.ru session key")
+		return "", fmt.Errorf("empty session key")
 	}
 	return result.SessionKey, nil
 }
 
+var callHashRegexp = regexp.MustCompile(`/call/join/([A-Za-z0-9_-]+)`)
+
 // Step 6: Join call to get TURN credentials
 func joinCallOK(sessionKey, callToken, vkLink string) (*Credentials, error) {
-	// Extract the call hash from the link
-	matches := callIDRegexp.FindStringSubmatch(vkLink)
+	// OK.ru expects just the hash, not the full URL
+	matches := callHashRegexp.FindStringSubmatch(vkLink)
 	if len(matches) < 2 {
-		return nil, fmt.Errorf("cannot extract call ID from: %s", vkLink)
+		return nil, fmt.Errorf("cannot extract call hash from: %s", vkLink)
 	}
 	callHash := matches[1]
 
 	params := url.Values{
 		"method":          {"vchat.joinConversationByLink"},
+		"format":          {"JSON"},
 		"application_key": {okAppKey},
 		"session_key":     {sessionKey},
-		"call_hash":       {callHash},
+		"anonymToken":     {callToken},
+		"joinLink":        {callHash},
+		"isVideo":         {"false"},
+		"protocolVersion": {"5"},
 	}
 
-	resp, err := http.PostForm("https://calls.okcdn.ru/fb.do", params)
+	resp, err := postForm("https://calls.okcdn.ru/fb.do", params)
 	if err != nil {
 		return nil, err
 	}
@@ -250,68 +262,47 @@ func joinCallOK(sessionKey, callToken, vkLink string) (*Credentials, error) {
 		return nil, err
 	}
 
-	// Parse the response — contains ICE servers with TURN credentials
+	// Response contains turn_server with username, credential, urls
 	var result struct {
-		ICEServers []struct {
-			URLs       interface{} `json:"urls"` // can be string or []string
-			Username   string      `json:"username"`
-			Credential string      `json:"credential"`
-		} `json:"ice_servers"`
-		TURNServers []struct {
+		TURNServer *struct {
 			URLs       interface{} `json:"urls"`
 			Username   string      `json:"username"`
 			Credential string      `json:"credential"`
-		} `json:"turn_list"`
-		Error *struct {
-			Message string `json:"error_msg"`
-		} `json:"error"`
+		} `json:"turn_server"`
+		ErrorMsg string `json:"error_msg"`
 	}
 
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("parse join response: %w (body: %s)", err, string(body))
+		return nil, fmt.Errorf("parse response: %w (body: %s)", err, string(body))
 	}
 
-	if result.Error != nil {
-		return nil, fmt.Errorf("OK.ru: %s", result.Error.Message)
+	if result.ErrorMsg != "" {
+		return nil, fmt.Errorf("OK.ru: %s", result.ErrorMsg)
 	}
 
-	creds := &Credentials{}
-
-	// Collect from both ice_servers and turn_list
-	type iceEntry struct {
-		URLs       interface{}
-		Username   string
-		Credential string
-	}
-	var all []iceEntry
-	for _, s := range result.ICEServers {
-		all = append(all, iceEntry{s.URLs, s.Username, s.Credential})
-	}
-	for _, s := range result.TURNServers {
-		all = append(all, iceEntry{s.URLs, s.Username, s.Credential})
+	if result.TURNServer == nil {
+		return nil, fmt.Errorf("no turn_server in response: %s", string(body))
 	}
 
-	for _, srv := range all {
-		if creds.Username == "" && srv.Username != "" {
-			creds.Username = srv.Username
-			creds.Password = srv.Credential
-		}
-		for _, u := range extractURLs(srv.URLs) {
-			addr := parseTURNURL(u)
-			if addr != "" {
-				creds.TURNServers = append(creds.TURNServers, addr)
-			}
+	creds := &Credentials{
+		Username: result.TURNServer.Username,
+		Password: result.TURNServer.Credential,
+	}
+
+	for _, u := range extractURLs(result.TURNServer.URLs) {
+		addr := parseTURNURL(u)
+		if addr != "" {
+			creds.TURNServers = append(creds.TURNServers, addr)
 		}
 	}
 
 	if len(creds.TURNServers) == 0 {
-		return nil, fmt.Errorf("no TURN servers in response: %s", string(body))
+		return nil, fmt.Errorf("no TURN server URLs in response: %s", string(body))
 	}
 
 	return creds, nil
 }
 
-// extractURLs handles both string and []string for URLs field.
 func extractURLs(v interface{}) []string {
 	switch urls := v.(type) {
 	case string:
@@ -328,12 +319,10 @@ func extractURLs(v interface{}) []string {
 	return nil
 }
 
-// parseTURNURL converts "turn:1.2.3.4:3478?transport=tcp" to "1.2.3.4:3478"
 func parseTURNURL(turnURL string) string {
 	addr := turnURL
 	addr = strings.TrimPrefix(addr, "turns:")
 	addr = strings.TrimPrefix(addr, "turn:")
-
 	if idx := strings.Index(addr, "?"); idx != -1 {
 		addr = addr[:idx]
 	}
